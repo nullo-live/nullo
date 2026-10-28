@@ -8,7 +8,7 @@ export function RevokeDemo() {
     { t: "approve(token, spender, 0, 0)", s: "Permit2 allowance", done: false },
   ];
   return (
-    <div className="mt-6 grid gap-5 lg:grid-cols-2" data-testid="revoke-demo">
+    <div className="mt-6 grid grid-cols-1 gap-5 lg:grid-cols-2 [&>*]:min-w-0" data-testid="revoke-demo">
       <div className="nl-card">
         <p className="nl-label m-0">Revoke queue</p>
         <p className="m-0 mt-2 text-[28px] font-bold tracking-tight sm:text-[36px]">2 of 3 closed</p>
@@ -25,7 +25,7 @@ export function RevokeDemo() {
       </div>
       <div className="nl-card">
         <p className="nl-label m-0">Call data, shown first</p>
-        <div className="mt-4 grid gap-2">
+        <div className="mt-4 grid grid-cols-1 gap-2 [&>*]:min-w-0">
           {calls.map((c) => (
             <div key={c.t} className={`flex items-center gap-3 rounded-2xl border px-4 py-3 ${c.done ? "border-[var(--line)] bg-[rgba(190,205,103,0.12)]" : "border-[var(--line-soft)] bg-white/70 opacity-70"}`}>
               <span className={`h-3 w-3 shrink-0 rounded-full ${c.done ? "bg-[var(--olive)]" : "bg-[var(--sky)]"}`} />

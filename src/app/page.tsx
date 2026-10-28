@@ -332,8 +332,8 @@ export default function Home() {
             </h2>
             <p className="nl-lead olive mx-auto max-w-[768px]">The scanner and the revoke queue are open to every address on {CHAIN.name}, and we reply to questions on X.</p>
           </div>
-          <div className="mt-14 grid gap-8 lg:grid-cols-2 lg:px-4">
-            <div className="nl-card nl-reveal !p-10 text-center">
+          <div className="mt-14 grid grid-cols-1 gap-8 lg:grid-cols-2 lg:px-4 [&>*]:min-w-0">
+            <div className="nl-card nl-reveal !p-7 sm:!p-10 text-center">
               <span className="nl-badge">Live on {CHAIN.name}</span>
               <h3 className="m-0 mt-6 text-[40px] leading-[1.25] font-bold tracking-tight sm:text-[48px]">Open to everyone</h3>
               <p className="mx-auto mt-4 max-w-[448px] text-[16px] leading-[26px] text-[var(--ink-70)]">Paste an address or connect a wallet to read its permissions. Connecting is needed only to revoke. Not a fit if you need to undo a transfer that already happened: nothing on chain can.</p>
@@ -348,7 +348,7 @@ export default function Home() {
                 first.
               </p>
             </div>
-            <div className="nl-card nl-reveal flex flex-col items-center justify-center !p-10 text-center">
+            <div className="nl-card nl-reveal flex flex-col items-center justify-center !p-7 sm:!p-10 text-center">
               <h3 className="m-0 text-[40px] leading-[1.25] font-bold tracking-tight sm:text-[48px]">Questions?</h3>
               <div className="mt-6 flex flex-wrap justify-center gap-3">
                 <a href={BRAND.x} target="_blank" rel="noreferrer" className="nl-btn outline md">
