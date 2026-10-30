@@ -3,11 +3,11 @@
 import Link from "next/link";
 import { usePathname } from "next/navigation";
 import { useEffect, useRef, useState } from "react";
-import { BRAND } from "@/config/brand";
+import { BRAND, hasGithub } from "@/config/brand";
 import { storageKey } from "@/config/storage";
 import { Brand } from "@/components/site/Brand";
 import { CaPill } from "@/components/site/CaCopy";
-import { CloseIcon, MenuIcon } from "@/components/site/Icons";
+import { CloseIcon, GitHubLogo, MenuIcon } from "@/components/site/Icons";
 import { TOP_NAV } from "@/components/site/nav";
 import { NavWallet } from "@/components/wallet/WalletButton";
 import { useLocalStore } from "@/components/wallet/useLocalStore";
@@ -68,6 +68,11 @@ export function SiteHeader() {
             <span className="nl-hide-sm">
               <CaPill />
             </span>
+            {hasGithub ? (
+              <a href={BRAND.github} target="_blank" rel="noreferrer" className="nl-btn outline nl-btn-head nl-hide-sm !px-3 max-[1199px]:!hidden" aria-label={`${BRAND.name} source code on GitHub`} title="Source code on GitHub">
+                <GitHubLogo size={18} />
+              </a>
+            ) : null}
             <span className="min-w-0">
               <NavWallet label="Connect" className="nl-btn outline nl-btn-head" />
             </span>
@@ -86,6 +91,11 @@ export function SiteHeader() {
               {n.label}
             </Link>
           ))}
+          {hasGithub ? (
+            <a href={BRAND.github} target="_blank" rel="noreferrer" className="!inline-flex items-center gap-2">
+              <GitHubLogo size={16} /> Source on GitHub
+            </a>
+          ) : null}
           <div className="mt-4 flex flex-wrap gap-3">
             <CaPill />
           </div>

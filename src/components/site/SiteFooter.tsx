@@ -2,7 +2,7 @@ import Link from "next/link";
 import { BRAND, hasGithub } from "@/config/brand";
 import { Brand } from "@/components/site/Brand";
 import { CaRow } from "@/components/site/CaCopy";
-import { XLogo } from "@/components/site/Icons";
+import { GitHubLogo, XLogo } from "@/components/site/Icons";
 import { FOOTER_COLUMNS } from "@/components/site/nav";
 
 export function SiteFooter() {
@@ -30,8 +30,8 @@ export function SiteFooter() {
               <XLogo size={14} /> {BRAND.xHandle}
             </a>
             {hasGithub ? (
-              <a href={BRAND.github} target="_blank" rel="noreferrer">
-                GitHub
+              <a href={BRAND.github} target="_blank" rel="noreferrer" className="!inline-flex items-center gap-2">
+                <GitHubLogo size={14} /> GitHub
               </a>
             ) : null}
           </nav>
