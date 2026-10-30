@@ -90,3 +90,13 @@ test("coverage scan: busy answers are retried in place, not shrunk; a long busy 
   assert.equal(stuck.paused, true);
   assert.deepEqual(stuck.ranges, []);
 });
+
+test("coverage scan: a window refused even at the smallest size is skipped and older blocks are still read", async () => {
+  const fetchWindow: WindowFetch = async (_t, from, to) => (from <= 50_000 && 50_000 <= to ? { range: true, message: "too many results" } : { logs: from <= 10_000 && 10_000 <= to ? [approvalLog(10_000)] : [] });
+  const r = await scanCoverage(OWNER, 1, 100_000, [], () => undefined, { stopped: false }, { fetchWindow, concurrency: 1 });
+  assert.equal(r.error, null);
+  assert.equal(r.skipped.length, 1);
+  assert.ok(r.skipped[0][0] <= 50_000 && 50_000 <= r.skipped[0][1] && r.skipped[0][1] - r.skipped[0][0] < 100);
+  assert.equal(r.events.length, 1, "blocks older than the skipped window were read");
+  assert.equal(r.ranges[0][0], 1);
+});

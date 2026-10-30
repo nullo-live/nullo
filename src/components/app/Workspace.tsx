@@ -298,6 +298,7 @@ export function Workspace() {
             const d = describeCoverage(ranges, lo, head);
             note(
               `Chain events: ${d.percent.toFixed(d.percent < 10 ? 2 : 1)}% of blocks ${fmt(lo)}–${fmt(head)} read (${fmt(r.queries)} new windows, ${r.events.length} new events, ${evs.length} in total).` +
+                (r.skipped.length ? ` ${r.skipped.length} block range${r.skipped.length === 1 ? "" : "s"} held too many logs to read and stay uncovered (first: ${fmt(r.skipped[0][0])}–${fmt(r.skipped[0][1])}).` : "") +
                 (r.paused ? ` Paused: ${r.error} Press Scan again later to continue where it stopped.` : r.error ? ` Stopped early: ${r.error}` : "") +
                 (stop.current.stopped ? " Stopped by you; progress is kept." : ""),
             );

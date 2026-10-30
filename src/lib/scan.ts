@@ -33,7 +33,10 @@ const ZERO = "0x0000000000000000000000000000000000000000";
 const OWNER_TOPICS = [...TOKEN_TOPICS, ...PERMIT2_TOPICS];
 
 export type ScanProgress = { lo: number; hi: number; covered: number; total: number; chunk: number; events: number; queries: number };
-export type ScanResult = { events: ApprovalEvent[]; ranges: Range[]; error: string | null; paused: boolean; queries: number };
+export type ScanResult = { events: ApprovalEvent[]; ranges: Range[]; skipped: Range[]; error: string | null; paused: boolean; queries: number };
+
+/** Smallest windows still refused after this many are skipped in one scan, the scan stops (likely the endpoint, not the data). */
+const MAX_SKIPPED = 20;
 
 /** The answer for one log window: the logs, a refusal a smaller window may pass, or a reason to stop. */
 export type WindowAnswer = { logs: RawLog[] } | { range: true; message: string } | { busy: true; message: string } | { fatal: string; paused?: boolean };
@@ -64,7 +67,8 @@ export const relayWindow: WindowFetch = async (topics, from, to) => {
 /**
  * Event scan of `owner` inside [lo, hi], skipping what `covered` already holds: windows of up to 30,000 blocks,
  * newest first, SCAN_CONCURRENCY in flight. A refused range shrinks the window (30k → 7.5k → … → 100); eight answers
- * in a row double it again. Stops on the stop signal, a relay budget answer (paused: resume later) or another error. Every window that
+ * in a row double it again. A window still refused at the smallest size is skipped (left uncovered, listed in
+ * `skipped`) and the scan goes on with older blocks. Stops on the stop signal, a relay budget answer (paused: resume later) or another error. Every window that
  * answered is returned in `ranges`, so the caller can store it as the resumable cursor.
  */
 export async function scanCoverage(
@@ -81,6 +85,7 @@ export async function scanCoverage(
   const topic = padTopic(owner);
   const events: ApprovalEvent[] = [];
   const done: Range[] = [];
+  const skipped: Range[] = [];
   const queue: Range[] = gaps(covered, lo, hi);
   const total = Math.max(0, hi - lo + 1);
   let chunk = MAX_CHUNK;
@@ -132,8 +137,14 @@ export async function scanCoverage(
       } else if ("range" in r) {
         const width = w[1] - w[0] + 1;
         if (width <= MIN_CHUNK) {
-          error = r.message;
-          return;
+          // Too many logs even in the smallest window (anyone can emit approvals naming this owner): leave it
+          // uncovered and keep reading older blocks, so one crowded window cannot stop the whole scan.
+          skipped.push(w);
+          if (skipped.length > MAX_SKIPPED) {
+            error = r.message;
+            return;
+          }
+          continue;
         }
         chunk = Math.min(chunk, Math.max(MIN_CHUNK, Math.floor(width / 4)));
         streak = 0;
@@ -147,7 +158,7 @@ export async function scanCoverage(
     }
   };
   await Promise.all(Array.from({ length: opts.concurrency ?? SCAN_CONCURRENCY }, worker));
-  return { events, ranges: mergeRanges(done), error, paused, queries };
+  return { events, ranges: mergeRanges(done), skipped: mergeRanges(skipped), error, paused, queries };
 }
 
 type Call3 = { target: `0x${string}`; allowFailure: boolean; callData: `0x${string}` };

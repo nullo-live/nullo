@@ -75,9 +75,24 @@ test("cursor is refused for another owner or any malformed field", () => {
   assert.equal(fromCursor({ ...c, events: [{ ...c.events[0], a: "-1" }] }, OWNER)?.events[0].amount, null);
 });
 
-test("cursor keeps the newest events when there are too many", () => {
-  const many = Array.from({ length: MAX_CURSOR_EVENTS + 10 }, (_, i) => ev(i + 1));
-  const c = toCursor(OWNER, [[1, many.length]], many);
-  assert.equal(c.events.length, MAX_CURSOR_EVENTS);
-  assert.equal(Math.min(...c.events.map((e) => e.b)), 11);
+const tok = (i: number) => `0x${(0x500000 + i).toString(16).padStart(40, "0")}`;
+
+test("cursor keeps only the newest event of each pair", () => {
+  const same = Array.from({ length: MAX_CURSOR_EVENTS + 10 }, (_, i) => ev(i + 1));
+  const c = toCursor(OWNER, [[1, same.length]], same);
+  assert.equal(c.events.length, 1);
+  assert.equal(c.events[0].b, same.length);
+  assert.deepEqual(c.ranges, [[1, same.length]]);
+});
+
+test("a flood of pairs cannot push an older real approval out while its blocks stay covered", () => {
+  const real = ev(5, { spender: "0x4444444444444444444444444444444444444444" });
+  const flood = Array.from({ length: MAX_CURSOR_EVENTS + 10 }, (_, i) => ev(1_000 + i, { token: tok(i) }));
+  const c = toCursor(OWNER, [[1, 50_000]], [real, ...flood]);
+  assert.ok(c.events.length <= MAX_CURSOR_EVENTS);
+  assert.ok(!c.events.some((e) => e.b === 5));
+  const low = Math.min(...c.ranges.map(([a]) => a));
+  assert.ok(low > 5, "the dropped real approval's block is no longer marked as read");
+  assert.ok(c.events.every((e) => e.b >= low), "every block still covered keeps its events");
+  assert.equal(Math.max(...c.ranges.map(([, b]) => b)), 50_000);
 });

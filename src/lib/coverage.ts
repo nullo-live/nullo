@@ -1,4 +1,4 @@
-import type { ApprovalEvent, Kind } from "@/lib/approvals";
+import { pairKey, type ApprovalEvent, type Kind } from "@/lib/approvals";
 
 /*
  * Block coverage of an event scan, free of I/O. The public RPC answers approval logs of one owner in windows of at
@@ -82,12 +82,27 @@ const ADDR = /^0x[0-9a-fA-F]{40}$/;
 const KINDS: Kind[] = ["erc20", "nft-all", "nft-one", "permit2"];
 
 export function toCursor(owner: string, ranges: Range[], events: ApprovalEvent[], at = Date.now()): CursorJson {
-  // Newest events are kept when the list is long: they decide the current state of a pair.
-  const kept = [...events].sort((x, y) => y.block - x.block || y.logIndex - x.logIndex).slice(0, MAX_CURSOR_EVENTS);
+  // Only the newest event of each pair decides its state, so older ones are dropped first.
+  const latest = new Map<string, ApprovalEvent>();
+  for (const e of events) {
+    const k = pairKey(e);
+    const p = latest.get(k);
+    if (!p || e.block > p.block || (e.block === p.block && e.logIndex > p.logIndex)) latest.set(k, e);
+  }
+  const sorted = [...latest.values()].sort((x, y) => y.block - x.block || y.logIndex - x.logIndex);
+  let kept = sorted;
+  let merged = mergeRanges(ranges);
+  if (sorted.length > MAX_CURSOR_EVENTS) {
+    // Still too many pairs (anyone can emit approvals naming this owner from throwaway tokens): keep the newest pairs
+    // and forget the blocks at and below the cut, so they are read again instead of hiding a pair that was dropped.
+    const cut = sorted[MAX_CURSOR_EVENTS].block;
+    kept = sorted.filter((e) => e.block > cut);
+    merged = merged.filter(([, b]) => b > cut).map(([a, b]): Range => [Math.max(a, cut + 1), b]);
+  }
   return {
     v: 1,
     owner: owner.toLowerCase(),
-    ranges: mergeRanges(ranges),
+    ranges: merged,
     events: kept.map((e) => ({ k: e.kind, t: e.token, s: e.spender, a: e.amount === null ? null : e.amount.toString(), p: e.approved, i: e.tokenId === null ? null : e.tokenId.toString(), e: e.expiration, b: e.block, x: e.tx, l: e.logIndex, ...(e.lockdown ? { d: 1 as const } : {}) })),
     at,
   };
