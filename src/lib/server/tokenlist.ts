@@ -1,18 +1,23 @@
 import "server-only";
 import { BRAND, USDG, WETH, isAddress } from "@/config/brand";
 import { readCappedResponse } from "@/lib/server/capped";
+import { ponsCurves } from "@/lib/server/chainread";
 
 /*
  * Token list for the quick check: the tokens of the most active pools on Robinhood Chain according to GeckoTerminal's
- * public API (no key), plus USDG, WETH and $NULLO once launched. Cached for 30 minutes; a failed refresh keeps the last
- * good list, and with no list at all the three fixed tokens still work. Only addresses and symbols come from here:
- * every allowance is read from the chain.
+ * public API (no key, five pages of pools), plus USDG, WETH and $NULLO once launched. Each token's Pons V2 curve is
+ * resolved on chain (src/lib/server/chainread.ts), so the quick check also reads the allowance to that curve.
+ * Cached for 30 minutes; a failed refresh keeps the last good list, and with no list at all the fixed tokens still
+ * work. Only addresses and symbols come from GeckoTerminal: every allowance is read from the chain.
  */
 
-export type ListedToken = { address: string; symbol: string };
+export type ListedToken = { address: string; symbol: string; curve?: string | null };
 
 const TTL = 30 * 60_000;
-const MAX = 60;
+/** A list that holds only the fixed tokens (GeckoTerminal did not answer) is retried after a minute. */
+const RETRY = 60_000;
+export const MAX_TOKENS = 100;
+const PAGES = [1, 2, 3, 4, 5];
 let cache: { at: number; list: ListedToken[] } | null = null;
 let inflight: Promise<void> | null = null;
 
@@ -47,23 +52,29 @@ async function fetchPage(page: number): Promise<ListedToken[]> {
 }
 
 export async function tokenList(): Promise<{ list: ListedToken[]; at: number | null; source: string }> {
-  if ((!cache || Date.now() - cache.at > TTL) && !inflight) {
-    inflight = Promise.all([1, 2, 3].map(fetchPage))
-      .then((pages) => {
+  const full = Boolean(cache && cache.list.length > fixed().length);
+  if ((!cache || Date.now() - cache.at > (full ? TTL : RETRY)) && !inflight) {
+    inflight = Promise.all(PAGES.map(fetchPage))
+      .then(async (pages) => {
         const seen = new Set<string>();
         const list: ListedToken[] = [];
         for (const t of [...fixed(), ...pages.flat()]) {
           const k = t.address.toLowerCase();
-          if (seen.has(k) || list.length >= MAX) continue;
+          if (seen.has(k) || list.length >= MAX_TOKENS) continue;
           seen.add(k);
           list.push(t);
         }
-        if (list.length > fixed().length || !cache) cache = { at: Date.now(), list };
+        const curves = await ponsCurves(list.map((t) => t.address)).catch(() => new Map<string, string | null>());
+        for (const t of list) if (curves.has(t.address.toLowerCase())) t.curve = curves.get(t.address.toLowerCase()) ?? null;
+        // A failed refresh keeps the last full list; with none, the fixed list is kept and retried soon.
+        if (list.length > fixed().length || !cache || cache.list.length <= fixed().length) cache = { at: Date.now(), list };
       })
       .finally(() => {
         inflight = null;
       });
   }
   if (!cache && inflight) await inflight;
-  return cache ? { list: cache.list, at: cache.at, source: "GeckoTerminal (top pools on Robinhood Chain) + fixed tokens" } : { list: fixed(), at: null, source: "fixed tokens only" };
+  return cache && cache.list.length > fixed().length
+    ? { list: cache.list, at: cache.at, source: "GeckoTerminal (top pools on Robinhood Chain) + fixed tokens, Pons curves read on chain" }
+    : { list: cache?.list ?? fixed(), at: cache?.at ?? null, source: "fixed tokens only (GeckoTerminal did not answer; retried within a minute)" };
 }

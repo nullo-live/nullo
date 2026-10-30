@@ -17,11 +17,11 @@ export function faqItems(): { q: string; a: string }[] {
     },
     {
       q: "How does the scanner find my approvals?",
-      a: `Three ways, each labelled in the results. It reads the chain's approval events for your address in block windows (the most recent first), it checks the current allowance of the most traded tokens on ${CHAIN.name} against well-known spenders, and, when this site has an explorer key configured, it asks the explorer for your full approval history. Whatever the source, the number shown is always a fresh read of the token, not an old event.`,
+      a: `Three ways, each labelled in the results. It reads the chain's approval events for your address in block windows (the most recent first), it checks the current allowance of the most traded tokens on ${CHAIN.name} against confirmed spenders (DEX routers, aggregators, Permit2 and each token's own Pons curve), and, when this site has an explorer key configured, it asks the explorer for your full approval history. Whatever the source, the number shown is always a fresh read of the token, not an old event.`,
     },
     {
       q: "Why might an old approval be missing?",
-      a: "Public RPC endpoints only answer event searches over limited block ranges, and this chain produces many blocks per second, so the event scan covers the window you choose. The quick check still finds open allowances of any age for common tokens and spenders, and you can check any token and spender pair by hand. When the explorer source is on, the full history is read.",
+      a: "Public RPC endpoints only answer event searches over limited block ranges, and this chain produces many blocks per second, so the event scan covers the window you choose (progress is kept in your browser, so a long window can be finished over several visits). The quick check still finds open allowances of any age for common tokens and spenders, and you can check any token and spender pair by hand. When the explorer source is on, the full history is read.",
     },
     {
       q: "What does revoking cost, and what exactly is sent?",

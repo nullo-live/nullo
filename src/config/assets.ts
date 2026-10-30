@@ -1,10 +1,10 @@
 /*
- * Every brand image path in one place. All of them are drawn from code by referensi/tools/make-brand.mjs (owner:
- * "AI-made for now, I will update"). To use the owner's artwork later, replace a file under public/brand or src/app and
- * keep its name, or change the path here.
+ * Every brand image path in one place. The mark, avatar, banner, icon, favicon and share card come from the owner's
+ * artwork (30 Oct 2026) via 2026/oktober/30/assets/apply-owner-assets.mjs; the guide covers are still drawn by
+ * referensi/tools/make-brand.mjs. Replace a file under public/brand or src/app and keep its name, or change the path here.
  */
 export const ASSETS = {
-  /** Mark: hexagon tile with an empty-set ring, transparent. 256x256 (header, footer, wallet, cards). */
+  /** Mark: the owner's olive n, transparent. 256x256 (header, footer, wallet, cards). */
   mark: "/brand/mark.webp",
   /** Larger mark (token page). 512x512. */
   markLarge: "/brand/mark-512.webp",

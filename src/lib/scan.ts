@@ -15,6 +15,7 @@ import {
   type RawLog,
 } from "@/lib/approvals";
 import { rpcBatchLoose, rpcCall } from "@/lib/client";
+import { coveredCount, gaps, mergeRanges, type Range } from "@/lib/coverage";
 
 /*
  * Browser side of the scanner. Every read goes through the site relay (exact request shapes, see src/lib/relay.ts):
@@ -22,85 +23,164 @@ import { rpcBatchLoose, rpcCall } from "@/lib/client";
  * Nothing here signs or sends anything.
  */
 
-const MAX_CHUNK = 10_000;
+/** Widest window: the official RPC's eth_getLogs limit and the relay's owner span. */
+export const MAX_CHUNK = 30_000;
 const MIN_CHUNK = 100;
+/** Requests in flight at once during an event scan. */
+export const SCAN_CONCURRENCY = 2;
 const ZERO = "0x0000000000000000000000000000000000000000";
+/** Token approvals and Permit2's own events of one owner, in one query (Permit2 events are told apart by emitter). */
+const OWNER_TOPICS = [...TOKEN_TOPICS, ...PERMIT2_TOPICS];
 
-export type ScanProgress = { from: number; to: number; head: number; stop: number; chunk: number; events: number; queries: number };
+export type ScanProgress = { lo: number; hi: number; covered: number; total: number; chunk: number; events: number; queries: number };
+export type ScanResult = { events: ApprovalEvent[]; ranges: Range[]; error: string | null; paused: boolean; queries: number };
 
-/** Backward log scan for `owner` from `head` down to `stop`. Shrinks the window when the RPC refuses a range. */
-export async function scanLogs(owner: string, head: number, stop: number, onProgress: (p: ScanProgress) => void, signal: { stopped: boolean }): Promise<{ events: ApprovalEvent[]; reached: number; error: string | null }> {
-  const events: ApprovalEvent[] = [];
+/** The answer for one log window: the logs, a refusal a smaller window may pass, or a reason to stop. */
+export type WindowAnswer = { logs: RawLog[] } | { range: true; message: string } | { busy: true; message: string } | { fatal: string; paused?: boolean };
+
+/** An upstream that is only busy (HTTP 429) or a fallback that refuses old logs: the same window may pass shortly. */
+export const isBusyError = (m: string) => /\b429\b|too many requests|archive|personal token/i.test(m);
+/** Reads approval logs of the owner topic in [from, to] with `topics`. */
+export type WindowFetch = (topics: [string[], string], from: number, to: number) => Promise<WindowAnswer>;
+
+/** One window through the site relay. */
+export const relayWindow: WindowFetch = async (topics, from, to) => {
+  const res = await fetch("/api/rpc", {
+    method: "POST",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify({ jsonrpc: "2.0", id: 0, method: "eth_getLogs", params: [{ fromBlock: `0x${from.toString(16)}`, toBlock: `0x${to.toString(16)}`, topics }] }),
+    cache: "no-store",
+  }).catch((e: unknown) => ({ ok: false, status: 0, json: async () => ({ error: e instanceof Error ? e.message : String(e) }) }) as unknown as Response);
+  const body = (await res.json().catch(() => null)) as { result?: RawLog[]; error?: { message?: string } | string } | null;
+  if (res.status === 429) return { fatal: (typeof body?.error === "string" ? body.error : null) ?? "The relay budget for your network is used up for now.", paused: true };
+  if (body && Array.isArray(body.result)) return { logs: body.result };
+  const msg = typeof body?.error === "string" ? body.error : (body?.error?.message ?? `Relay answered ${res.status}`);
+  if (isBusyError(msg)) return { busy: true, message: msg };
+  // An upstream refusal of the range (or a timeout on a wide one) may pass in a smaller window.
+  if (isRangeError(msg) || res.status === 502 || res.status === 0) return { range: true, message: msg };
+  return { fatal: msg };
+};
+
+/**
+ * Event scan of `owner` inside [lo, hi], skipping what `covered` already holds: windows of up to 30,000 blocks,
+ * newest first, SCAN_CONCURRENCY in flight. A refused range shrinks the window (30k → 7.5k → … → 100); eight answers
+ * in a row double it again. Stops on the stop signal, a relay budget answer (paused: resume later) or another error. Every window that
+ * answered is returned in `ranges`, so the caller can store it as the resumable cursor.
+ */
+export async function scanCoverage(
+  owner: string,
+  lo: number,
+  hi: number,
+  covered: Range[],
+  onProgress: (p: ScanProgress) => void,
+  signal: { stopped: boolean },
+  opts: { fetchWindow?: WindowFetch; maxWindows?: number; concurrency?: number; deadline?: number } = {},
+): Promise<ScanResult> {
+  const fetchWindow = opts.fetchWindow ?? relayWindow;
+  let budget = opts.maxWindows ?? Infinity;
   const topic = padTopic(owner);
+  const events: ApprovalEvent[] = [];
+  const done: Range[] = [];
+  const queue: Range[] = gaps(covered, lo, hi);
+  const total = Math.max(0, hi - lo + 1);
   let chunk = MAX_CHUNK;
-  let to = head;
+  let streak = 0;
+  let busyRun = 0;
   let queries = 0;
   let error: string | null = null;
-  while (to >= stop && !signal.stopped) {
-    const from = Math.max(stop, to - chunk + 1);
-    const range = { fromBlock: `0x${from.toString(16)}`, toBlock: `0x${to.toString(16)}` };
-    try {
-      const res = await fetch("/api/rpc", {
-        method: "POST",
-        headers: { "content-type": "application/json" },
-        body: JSON.stringify([
-          { jsonrpc: "2.0", id: 0, method: "eth_getLogs", params: [{ ...range, topics: [[...TOKEN_TOPICS], topic] }] },
-          { jsonrpc: "2.0", id: 1, method: "eth_getLogs", params: [{ ...range, address: PERMIT2, topics: [[...PERMIT2_TOPICS], topic] }] },
-        ]),
-        cache: "no-store",
-      });
-      const body = (await res.json().catch(() => null)) as { id: number; result?: RawLog[]; error?: { message?: string } }[] | { error?: string } | null;
-      if (!Array.isArray(body)) {
-        error = (body && typeof body.error === "string" ? body.error : null) ?? `Relay answered ${res.status}`;
-        if (res.status === 429) break;
-        throw new Error(error);
-      }
-      const failed = body.find((b) => b.error || !Array.isArray(b.result));
-      if (failed) {
-        // The relay maps every upstream refusal to "read failed": treat it as a range problem first.
-        if (chunk > MIN_CHUNK) {
-          chunk = Math.max(MIN_CHUNK, Math.floor(chunk / 4));
-          continue;
+  let paused = false;
+  const report = () => onProgress({ lo, hi, covered: coveredCount([...covered, ...done], lo, hi), total, chunk, events: events.length, queries });
+  /** Takes the newest window of at most `chunk` blocks off the queue. */
+  const take = (): Range | null => {
+    const g = queue.shift();
+    if (!g) return null;
+    const [a, b] = g;
+    const from = Math.max(a, b - chunk + 1);
+    if (from > a) queue.unshift([a, from - 1]);
+    return [from, b];
+  };
+  const worker = async () => {
+    while (!signal.stopped && !error && !paused && budget > 0 && (!opts.deadline || Date.now() < opts.deadline)) {
+      const w = take();
+      if (!w) return;
+      budget -= 1;
+      const r = await fetchWindow([OWNER_TOPICS, topic], w[0], w[1]);
+      if ("logs" in r) {
+        for (const l of r.logs) {
+          const e = decodeLog(l, PERMIT2);
+          if (e) events.push(e);
         }
-        error = failed.error?.message ?? "The chain refused the log query.";
-        break;
+        queries += 1;
+        busyRun = 0;
+        done.push(w);
+        // A refusal can be one endpoint's bad moment: after a run of answers the window grows back.
+        if (++streak >= 8 && chunk < MAX_CHUNK) {
+          chunk = Math.min(MAX_CHUNK, chunk * 2);
+          streak = 0;
+        }
+        report();
+      } else if ("busy" in r) {
+        // Wait and ask again; five busy answers in a row pause the scan (the cursor keeps what was read).
+        if (++busyRun > 5) {
+          error = `The chain's RPC is busy (${r.message.slice(0, 80)}).`;
+          paused = true;
+          return;
+        }
+        budget += 1;
+        queue.unshift(w);
+        await new Promise((res) => setTimeout(res, 600 * busyRun + Math.floor(Math.random() * 400)));
+      } else if ("range" in r) {
+        const width = w[1] - w[0] + 1;
+        if (width <= MIN_CHUNK) {
+          error = r.message;
+          return;
+        }
+        chunk = Math.min(chunk, Math.max(MIN_CHUNK, Math.floor(width / 4)));
+        streak = 0;
+        budget += 1; // a refused window is read again, smaller
+        queue.unshift(w);
+      } else {
+        error = r.fatal;
+        paused = Boolean(r.paused);
+        return;
       }
-      for (const b of body) for (const l of b.result ?? []) {
-        const e = decodeLog(l, PERMIT2);
-        if (e) events.push(e);
-      }
-      queries += 1;
-      onProgress({ from, to, head, stop, chunk, events: events.length, queries });
-      to = from - 1;
-    } catch (e) {
-      const msg = e instanceof Error ? e.message : String(e);
-      if (isRangeError(msg) && chunk > MIN_CHUNK) {
-        chunk = Math.max(MIN_CHUNK, Math.floor(chunk / 4));
-        continue;
-      }
-      error = msg;
-      break;
     }
-  }
-  return { events, reached: Math.max(stop, to + 1), error };
+  };
+  await Promise.all(Array.from({ length: opts.concurrency ?? SCAN_CONCURRENCY }, worker));
+  return { events, ranges: mergeRanges(done), error, paused, queries };
 }
 
 type Call3 = { target: `0x${string}`; allowFailure: boolean; callData: `0x${string}` };
 type Decoder = { abi: Abi; fn: string };
 
-/** Runs reads through Multicall3 in batches; each entry is the decoded result or null when it failed. */
-export async function multiRead(calls: (Call3 & Decoder)[]): Promise<unknown[]> {
-  const out: unknown[] = [];
-  for (let i = 0; i < calls.length; i += 100) {
-    const chunk = calls.slice(i, i + 100);
-    const data = encodeFunctionData({ abi: MULTICALL3_ABI, functionName: "aggregate3", args: [chunk.map(({ target, allowFailure, callData }) => ({ target, allowFailure, callData }))] });
-    let results: readonly { success: boolean; returnData: `0x${string}` }[] = [];
-    try {
-      const raw = await rpcCall<`0x${string}`>("eth_call", [{ to: MULTICALL3, data }, "latest"]);
-      results = decodeFunctionResult({ abi: MULTICALL3_ABI, functionName: "aggregate3", data: raw }) as never;
-    } catch {
-      results = [];
+/** Sends one Multicall3 aggregate3 call and returns the raw answer. The browser goes through the relay. */
+export type MulticallExec = (data: `0x${string}`) => Promise<`0x${string}`>;
+const relayExec: MulticallExec = (data) => rpcCall<`0x${string}`>("eth_call", [{ to: MULTICALL3, data }, "latest"]);
+
+/** Inner calls per Multicall3 batch (the relay allows 120). */
+export const MULTICALL_BATCH = 100;
+
+/** Runs reads through Multicall3 in batches (two in flight); each entry is the decoded result or null when it failed. */
+export async function multiRead(calls: (Call3 & Decoder)[], exec: MulticallExec = relayExec): Promise<unknown[]> {
+  const chunks: (Call3 & Decoder)[][] = [];
+  for (let i = 0; i < calls.length; i += MULTICALL_BATCH) chunks.push(calls.slice(i, i + MULTICALL_BATCH));
+  const answers: (readonly { success: boolean; returnData: `0x${string}` }[])[] = new Array(chunks.length);
+  let next = 0;
+  const worker = async () => {
+    while (next < chunks.length) {
+      const n = next++;
+      const data = encodeFunctionData({ abi: MULTICALL3_ABI, functionName: "aggregate3", args: [chunks[n].map(({ target, allowFailure, callData }) => ({ target, allowFailure, callData }))] });
+      try {
+        answers[n] = decodeFunctionResult({ abi: MULTICALL3_ABI, functionName: "aggregate3", data: await exec(data) }) as never;
+      } catch {
+        answers[n] = [];
+      }
     }
+  };
+  await Promise.all([worker(), worker()]);
+  const out: unknown[] = [];
+  chunks.forEach((chunk, n) => {
+    const results = answers[n] ?? [];
     chunk.forEach((c, k) => {
       const r = results[k];
       if (!r || !r.success || r.returnData.length < 4) return out.push(null);
@@ -111,7 +191,7 @@ export async function multiRead(calls: (Call3 & Decoder)[]): Promise<unknown[]> 
         out.push(null);
       }
     });
-  }
+  });
   return out;
 }
 
@@ -138,8 +218,8 @@ function stateCall(owner: string, p: Pair) {
 }
 
 /** Fresh state of every pair (keyed by pair key). */
-export async function readCurrent(owner: string, pairs: Pair[]): Promise<Map<string, Current>> {
-  const res = await multiRead(pairs.map((p) => stateCall(owner, p)));
+export async function readCurrent(owner: string, pairs: Pair[], exec?: MulticallExec): Promise<Map<string, Current>> {
+  const res = await multiRead(pairs.map((p) => stateCall(owner, p)), exec);
   const out = new Map<string, Current>();
   pairs.forEach((p, i) => {
     const v = res[i];
@@ -160,10 +240,10 @@ export async function readCurrent(owner: string, pairs: Pair[]): Promise<Map<str
 export type TokenMeta = { symbol: string | null; decimals: number | null; name: string | null };
 
 /** Symbol, decimals and name of each token (null where the token does not answer). */
-export async function tokenMeta(tokens: string[]): Promise<Map<string, TokenMeta>> {
+export async function tokenMeta(tokens: string[], exec?: MulticallExec): Promise<Map<string, TokenMeta>> {
   const uniq = [...new Set(tokens.map((t) => t.toLowerCase()))];
   const calls = uniq.flatMap((t) => [call(t, ERC20_ABI as Abi, "symbol", []), call(t, ERC20_ABI as Abi, "decimals", []), call(t, ERC20_ABI as Abi, "name", [])]);
-  const res = await multiRead(calls);
+  const res = await multiRead(calls, exec);
   const out = new Map<string, TokenMeta>();
   uniq.forEach((t, i) => {
     const [s, d, n] = res.slice(i * 3, i * 3 + 3);
@@ -203,25 +283,46 @@ export async function blockTimes(blocks: number[]): Promise<Map<number, number>>
   return out;
 }
 
+/** A token for the quick check; `curve` is its Pons bonding curve when it was launched on Pons V2. */
+export type QuickToken = { address: string; curve?: string | null };
+
 /**
- * Quick check: for every listed token, the allowance to each known spender, plus each token's Permit2 allowance to the
- * known spenders. Finds open permissions of any age for common pairs, without logs. Returns only the open ones.
+ * Pairs the quick check reads: for every token, its allowance to each known spender, Permit2 allowance(owner, token,
+ * spender) for the spenders that pull through Permit2 (plus any extra spender), and the allowance to the token's own
+ * Pons curve. Repeated tokens and spenders are read once.
  */
-export async function quickCheck(owner: string, tokens: string[], extraSpenders: string[] = []): Promise<Pair[]> {
-  const spenders = [...new Set([...KNOWN_SPENDERS.map((s) => s.address), ...extraSpenders].map((s) => getAddress(s)))];
-  const pairs: Pair[] = [];
+export function quickPairs(tokens: QuickToken[], extraSpenders: string[] = []): Pair[] {
+  const plain = [...new Set([...KNOWN_SPENDERS.map((s) => s.address), ...extraSpenders].map((s) => getAddress(s)))];
+  const viaPermit2 = new Set([...KNOWN_SPENDERS.filter((s) => s.permit2).map((s) => s.address), ...extraSpenders].map((s) => s.toLowerCase()));
+  const pairs = new Map<string, Pair>();
+  const add = (p: Pair) => pairs.set(p.key, p);
   for (const t of tokens) {
-    for (const s of spenders) pairs.push(barePair("erc20", t, s, "quick"));
-    for (const s of spenders) if (s.toLowerCase() !== PERMIT2.toLowerCase()) pairs.push(barePair("permit2", t, s, "quick"));
+    if (!/^0x[0-9a-fA-F]{40}$/.test(t.address)) continue;
+    for (const s of plain) add(barePair("erc20", t.address, s, "quick"));
+    for (const s of plain) if (viaPermit2.has(s.toLowerCase()) && s.toLowerCase() !== PERMIT2.toLowerCase()) add(barePair("permit2", t.address, s, "quick"));
+    if (t.curve && /^0x[0-9a-fA-F]{40}$/.test(t.curve) && !/^0x0{40}$/.test(t.curve)) add(barePair("erc20", t.address, t.curve, "quick"));
   }
-  const cur = await readCurrent(owner, pairs);
-  const now = Math.floor(Date.now() / 1000);
+  return [...pairs.values()];
+}
+
+/** Keeps the pairs that are open right now (expired Permit2 allowances are closed). */
+export function openOnly(pairs: Pair[], cur: Map<string, Current>, nowSec: number): Pair[] {
   return pairs.filter((p) => {
     const c = cur.get(p.key);
     if (!c || c.unreadable || !c.amount) return false;
-    if (p.kind === "permit2" && c.expiration && c.expiration < now) return false;
+    if (p.kind === "permit2" && c.expiration && c.expiration < nowSec) return false;
     return true;
   });
+}
+
+/**
+ * Quick check: reads every pair from quickPairs() at the latest block. Finds open permissions of any age for common
+ * pairs, without logs. Returns only the open ones, with the state that was read.
+ */
+export async function quickCheck(owner: string, tokens: QuickToken[], extraSpenders: string[] = [], exec?: MulticallExec): Promise<{ open: Pair[]; current: Map<string, Current>; read: number }> {
+  const pairs = quickPairs(tokens, extraSpenders);
+  const cur = await readCurrent(owner, pairs, exec);
+  return { open: openOnly(pairs, cur, Math.floor(Date.now() / 1000)), current: cur, read: pairs.length };
 }
 
 export type LabelFacts = { labels: number; flags: number; byReason: number[]; byCategory: number[] };

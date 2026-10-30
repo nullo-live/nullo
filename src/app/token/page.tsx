@@ -16,7 +16,7 @@ const PLANNED = [
   { t: "Analytics credits", p: "Deeper history scans and reports across many addresses. Planned; today every scan in the app is free." },
   { t: "Approval alerts", p: "A notice when one of your permissions changes or a spender you use gets flagged. Planned; today you re-scan when you want." },
   { t: "Monitoring", p: "Watch a list of addresses, such as a team treasury, without opening the app. Planned." },
-  { t: "Developer API", p: "Permission reads and label counts for wallets and tools. Planned; today everything is readable from the chain directly." },
+  { t: "Developer API", p: "Higher limits and alerts for wallets and tools. Planned. The free read endpoint /api/approvals is already open to everyone, and everything is readable from the chain directly." },
 ];
 
 export default function TokenPage() {

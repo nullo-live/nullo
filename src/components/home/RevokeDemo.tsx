@@ -20,7 +20,7 @@ export function RevokeDemo() {
           <i style={{ width: "67%" }} />
         </div>
         <p className="m-0 mt-5 text-[14px] leading-[22.75px] text-[var(--ink-70)]">
-          <b className="text-[var(--ink)]">One at a time.</b> Each row opens your wallet only when you press it, and the state is read from the chain again before the next one.
+          <b className="text-[var(--ink)]">One at a time, or one batch.</b> Each row opens your wallet only when you press it; a wallet with atomic batches can sign the whole queue at once. Every row is read from the chain again afterwards.
         </p>
       </div>
       <div className="nl-card">

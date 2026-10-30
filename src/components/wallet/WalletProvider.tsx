@@ -14,6 +14,7 @@ import { useLocalStore } from "@/components/wallet/useLocalStore";
 import { walletConnectProvider } from "@/components/wallet/walletconnect";
 import { formatEth, rpc } from "@/lib/rpc";
 import { storageKey } from "@/config/storage";
+import { atomicSupport, batchId, callsStatus, sendCallsParams, type BatchCall, type BatchState, type BatchSupport } from "@/lib/batch";
 
 /**
  * Wallet connection over EIP-6963 browser wallets and WalletConnect.
@@ -69,6 +70,12 @@ type WalletState = {
   switchNetwork: () => Promise<void>;
   /** Sends a transaction from the connected account and resolves its hash. No `to` = contract deployment. */
   sendTransaction: (tx: { to?: string; data: string; value?: bigint }) => Promise<string>;
+  /** EIP-5792: whether the wallet runs atomic call batches on Robinhood Chain ("none" when it does not say so). */
+  batchSupport: () => Promise<BatchSupport>;
+  /** EIP-5792 wallet_sendCalls (atomic) from the connected account; resolves the batch id. */
+  sendBatch: (calls: BatchCall[]) => Promise<string>;
+  /** EIP-5792 wallet_getCallsStatus for a batch id. */
+  batchStatus: (id: string) => Promise<BatchState>;
   /** personal_sign of a plain-text message by the connected account. */
   signMessage: (message: string) => Promise<string>;
   /** eth_signTypedData_v4 by the connected account (EIP-712 payload as an object). */
@@ -361,6 +368,42 @@ export function WalletProvider({ children }: { children: React.ReactNode }) {
     [active, remembered],
   );
 
+  const batchSupport = useCallback(async (): Promise<BatchSupport> => {
+    if (!active || !remembered) return "none";
+    try {
+      const caps = await active.provider.request({ method: "wallet_getCapabilities", params: [remembered.address, [CHAIN_ID_HEX]] });
+      return atomicSupport(caps, CHAIN_ID_HEX);
+    } catch {
+      // Wallets without EIP-5792 answer "method not found": the one-by-one queue stays.
+      return "none";
+    }
+  }, [active, remembered]);
+
+  const sendBatch = useCallback(
+    async (calls: BatchCall[]) => {
+      if (!active || !remembered) throw new Error("Connect a wallet first.");
+      if ((await readChainId(active.provider)) !== chain.id) throw new Error(`Switch the wallet to ${chain.name} first.`);
+      let answer: unknown;
+      try {
+        answer = await active.provider.request({ method: "wallet_sendCalls", params: sendCallsParams(remembered.address, CHAIN_ID_HEX, calls) });
+      } catch (cause) {
+        throw new Error(describe(cause, "The wallet did not send the batch."));
+      }
+      const id = batchId(answer);
+      if (!id) throw new Error("The wallet did not return a batch id.");
+      return id;
+    },
+    [active, remembered],
+  );
+
+  const batchStatus = useCallback(
+    async (id: string) => {
+      if (!active) throw new Error("Connect a wallet first.");
+      return callsStatus(await active.provider.request({ method: "wallet_getCallsStatus", params: [id] }));
+    },
+    [active],
+  );
+
   const signMessage = useCallback(
     async (message: string) => {
       if (!active || !remembered) throw new Error("Connect a wallet first.");
@@ -450,6 +493,9 @@ export function WalletProvider({ children }: { children: React.ReactNode }) {
       connect,
       switchNetwork,
       sendTransaction,
+      batchSupport,
+      sendBatch,
+      batchStatus,
       signMessage,
       signTypedData,
       refreshBalance,
@@ -468,6 +514,9 @@ export function WalletProvider({ children }: { children: React.ReactNode }) {
       connect,
       switchNetwork,
       sendTransaction,
+      batchSupport,
+      sendBatch,
+      batchStatus,
       signMessage,
       signTypedData,
       refreshBalance,

@@ -8,7 +8,7 @@ import { useChain } from "@/components/providers/ChainProvider";
 import { AddressChip } from "@/components/site/CaCopy";
 import { useWalletModal } from "@/components/wallet/WalletButton";
 import { useWallet } from "@/components/wallet/WalletProvider";
-import { CHAIN, KNOWN_SPENDERS, PERMIT2, explorerAddress, explorerTx, isAddress, shortAddress } from "@/config/brand";
+import { CHAIN, KNOWN_SPENDERS, PERMIT2, explorerAddress, explorerTx, isAddress, knownSpenderName, shortAddress } from "@/config/brand";
 import { labelsLive } from "@/config/contracts";
 import { storageKey } from "@/config/storage";
 import {
@@ -29,11 +29,16 @@ import {
 } from "@/lib/approvals";
 import { explain, rpcCall, waitForReceipt } from "@/lib/client";
 import { practiceLoad } from "@/lib/labels";
-import { blockTimes, hasCode, labelCounts, quickCheck, readCurrent, scanLogs, tokenMeta, type LabelFacts, type ScanProgress, type TokenMeta } from "@/lib/scan";
+import type { ApiAnswer } from "@/lib/approvals-api";
+import type { BatchSupport } from "@/lib/batch";
+import { describeCoverage, fromCursor, mergeRanges, toCursor, type Range } from "@/lib/coverage";
+import { blockTimes, hasCode, labelCounts, quickCheck, readCurrent, scanCoverage, tokenMeta, type LabelFacts, type ScanProgress, type TokenMeta } from "@/lib/scan";
 
 /*
  * The permission workspace: scan an address, list what is open now, review spenders, queue revokes the user's own wallet
- * signs one by one, and read the approval history that was found. Read-only until the user presses a sign button.
+ * signs (one by one, or in one EIP-5792 batch when the wallet offers atomic batches), and read the approval history
+ * that was found. Read-only until the user presses a sign button.
+ * Deep link: /app?owner=0x…[&spender=0x…][&tab=review] fills the address, starts the scan and filters to one spender.
  */
 
 type Tab = "dashboard" | "review" | "revoke" | "history" | "check";
@@ -45,16 +50,37 @@ const TABS: { id: Tab; label: string }[] = [
   { id: "check", label: "Check a pair" },
 ];
 
+/** Event windows. `seconds: 0` = the whole chain from block 1 (read over several visits; progress is kept). */
 const DEPTHS = [
   { id: "quarter", label: "Last 15 minutes", seconds: 900 },
   { id: "hour", label: "Last hour", seconds: 3600 },
   { id: "six", label: "Last 6 hours", seconds: 6 * 3600 },
   { id: "day", label: "Last 24 hours", seconds: 24 * 3600 },
+  { id: "week", label: "Last 7 days", seconds: 7 * 86_400 },
+  { id: "month", label: "Last 30 days", seconds: 30 * 86_400 },
+  { id: "all", label: "Whole chain (resumable)", seconds: 0 },
 ] as const;
 
-const SOURCE_WORDS: Record<string, string> = { logs: "Chain events", quick: "Quick check", explorer: "Explorer history", manual: "Checked by hand" };
+const SOURCE_WORDS: Record<string, string> = { logs: "Chain events", quick: "Known spenders", explorer: "Explorer history", manual: "Checked by hand", server: "Site scan" };
 const LAST_KEY = storageKey("app", "last");
 const queueKey = (owner: string) => storageKey("queue", owner.toLowerCase());
+const cursorKey = (owner: string) => storageKey("cursor", owner.toLowerCase());
+
+function loadCursor(owner: string) {
+  try {
+    return fromCursor(JSON.parse(window.localStorage.getItem(cursorKey(owner)) ?? "null"), owner);
+  } catch {
+    return null;
+  }
+}
+function saveCursor(owner: string, ranges: Range[], events: ApprovalEvent[]) {
+  try {
+    window.localStorage.setItem(cursorKey(owner), JSON.stringify(toCursor(owner, ranges, events)));
+  } catch {
+    // storage full or blocked: progress lives only in this tab
+  }
+}
+const fmt = (n: number) => n.toLocaleString("en-US");
 
 type Row = { pair: Pair; cur: Current | undefined; open: boolean };
 type QItem = { key: string; kind: Kind; token: string; spender: string; tokenId: string | null; state: "queued" | "sending" | "done" | "failed"; tx?: string; note?: string };
@@ -78,11 +104,14 @@ const pairOf = (q: QItem): Pair => barePair(q.kind, q.token, q.spender, "queue",
 
 export function Workspace() {
   const params = useSearchParams();
-  const { address, sendTransaction, onRobinhoodChain, switchNetwork } = useWallet();
+  const { address, sendTransaction, onRobinhoodChain, switchNetwork, batchSupport, sendBatch, batchStatus } = useWallet();
   const { open: openWallet } = useWalletModal();
   const { facts } = useChain();
   const [tab, setTab] = useState<Tab>((TABS.find((t) => t.id === params.get("tab"))?.id ?? "dashboard") as Tab);
-  const [input, setInput] = useState(params.get("address") ?? "");
+  const linkOwner = params.get("owner") ?? params.get("address") ?? "";
+  const linkSpender = params.get("spender") ?? "";
+  const [input, setInput] = useState(isAddress(linkOwner) ? linkOwner : "");
+  const [spenderFilter, setSpenderFilter] = useState<string | null>(isAddress(linkSpender) ? getAddress(linkSpender) : null);
   const [owner, setOwner] = useState<string | null>(null);
   const [depth, setDepth] = useState<(typeof DEPTHS)[number]["id"]>("hour");
   const [useLogs, setUseLogs] = useState(true);
@@ -102,7 +131,9 @@ export function Workspace() {
   const [labels, setLabels] = useState<Map<string, LabelFacts> | null>(null);
   const [times, setTimes] = useState<Map<number, number>>(new Map());
   const [verified, setVerified] = useState<Map<string, boolean | null>>(new Map());
-  const [scanned, setScanned] = useState<{ from: number; to: number; at: number } | null>(null);
+  const [scanned, setScanned] = useState<{ lo: number; head: number; ranges: Range[]; at: number; paused: boolean } | null>(null);
+  const [curves, setCurves] = useState<Map<string, string>>(new Map());
+  const [serverLabels, setServerLabels] = useState<Map<string, string>>(new Map());
   const [showClosed, setShowClosed] = useState(false);
   const [queue, setQueue] = useState<QItem[]>([]);
   const stop = useRef({ stopped: false });
@@ -115,11 +146,11 @@ export function Workspace() {
     try {
       const last = JSON.parse(window.localStorage.getItem(LAST_KEY) ?? "null") as { depth?: string; address?: string } | null;
       if (last?.depth && DEPTHS.some((d) => d.id === last.depth)) setDepth(last.depth as never);
-      if (!params.get("address") && last?.address) setInput(last.address);
+      if (!isAddress(linkOwner) && last?.address) setInput(last.address);
     } catch {
       // nothing saved
     }
-  }, [params]);
+  }, [params, linkOwner]);
 
   // A freshly connected wallet fills an empty address box.
   useEffect(() => {
@@ -142,6 +173,7 @@ export function Workspace() {
 
   const pace = facts?.blockPace && facts.blockPace > 0 ? facts.blockPace : 0.104;
   const depthBlocks = Math.round(DEPTHS.find((d) => d.id === depth)!.seconds / pace);
+  const head = facts?.block ?? null;
 
   /** Fills in everything a list of pairs needs: current state, token facts, spender code, labels, event times. */
   const enrich = useCallback(async (who: string, list: Pair[], evs: ApprovalEvent[]) => {
@@ -169,8 +201,8 @@ export function Workspace() {
     }
   }, []);
 
-  const scan = async () => {
-    const who = input.trim();
+  const scan = async (override?: string) => {
+    const who = (override ?? input).trim();
     if (!isAddress(who)) return setError("Enter a wallet address: 0x followed by 40 hex characters.");
     const ownerAddr = getAddress(who);
     setError(null);
@@ -192,17 +224,41 @@ export function Workspace() {
     try {
       setPhase("Reading the chain head…");
       const head = Number(BigInt(await rpcCall<string>("eth_blockNumber", [])));
-      const stopAt = Math.max(1, head - depthBlocks + 1);
+      const lo = depthBlocks === 0 ? 1 : Math.max(1, head - depthBlocks + 1);
       const tasks: Promise<Map<string, Pair>>[] = [];
       let allEvents: ApprovalEvent[] = [];
 
       if (useQuick) {
         tasks.push(
           (async () => {
-            const res = await fetch("/api/tokens").then((r) => r.json() as Promise<{ list: { address: string }[]; source: string }>);
-            const open = await quickCheck(ownerAddr, res.list.map((t) => t.address));
-            note(`Quick check: ${res.list.length} tokens × ${KNOWN_SPENDERS.length} known spenders (plain and through Permit2), ${open.length} open.`);
-            return new Map(open.map((p) => [p.key, p]));
+            // The site's own read first (known spenders + Pons curves + its event windows, cached); the same quick
+            // check through the relay when that is busy.
+            const r = await fetch(`/api/approvals?owner=${ownerAddr}`, { cache: "no-store" });
+            if (r.ok) {
+              const a = (await r.json()) as ApiAnswer;
+              const labelsFrom = new Map<string, string>();
+              const out = new Map<string, Pair>();
+              for (const x of a.approvals) {
+                const p = barePair(x.kind, x.token, x.spender, "quick", x.tokenId === null ? null : BigInt(x.tokenId));
+                p.source = new Set(x.foundBy.map((f) => (f === "logs" ? "server" : f)));
+                out.set(p.key, p);
+                if (x.spenderLabel) labelsFrom.set(x.spender.toLowerCase(), x.spenderLabel);
+              }
+              setServerLabels((m) => new Map([...m, ...labelsFrom]));
+              const c = a.coverage;
+              note(
+                `Site read: ${a.coverage.quickCheck.tokens} tokens × ${KNOWN_SPENDERS.length} known spenders + Pons curves (${fmt(c.quickCheck.pairs)} pairs)` +
+                  (c.source === "blockscout" ? ", plus explorer history" : c.fromBlock !== null ? `, plus its event windows from block ${fmt(c.fromBlock)}` : "") +
+                  `: ${a.counts.open} open${a.cached ? " (cached)" : ""}.`,
+              );
+              return out;
+            }
+            const res = await fetch("/api/tokens").then((x) => x.json() as Promise<{ list: { address: string; symbol: string; curve?: string | null }[] }>);
+            setCurves(new Map(res.list.filter((t) => t.curve).map((t) => [t.curve!.toLowerCase(), t.symbol])));
+            const q = await quickCheck(ownerAddr, res.list);
+            note(`Quick check: ${res.list.length} tokens × ${KNOWN_SPENDERS.length} known spenders + Pons curves (${fmt(q.read)} pairs), ${q.open.length} open.`);
+            setCurrent((m) => new Map([...m, ...q.current]));
+            return new Map(q.open.map((p) => [p.key, p]));
           })().catch((e) => {
             note(`Quick check did not finish: ${explain(e)}`);
             return new Map<string, Pair>();
@@ -230,11 +286,22 @@ export function Workspace() {
       if (useLogs) {
         tasks.push(
           (async () => {
-            const r = await scanLogs(ownerAddr, head, stopAt, (p) => setProgress(p), stop.current);
-            allEvents = [...allEvents, ...r.events];
-            setScanned({ from: r.reached, to: head, at: Date.now() });
-            note(`Chain events: blocks ${r.reached.toLocaleString("en-US")} to ${head.toLocaleString("en-US")}, ${r.events.length} approval events.${r.error ? ` Stopped early: ${r.error}` : ""}${stop.current.stopped ? " Stopped by you." : ""}`);
-            return pairsFrom(r.events, "logs");
+            // Blocks read on earlier visits are kept per owner and skipped; only what is missing is read.
+            const saved = loadCursor(ownerAddr);
+            const before = saved?.ranges ?? [];
+            const r = await scanCoverage(ownerAddr, lo, head, before, (p) => setProgress(p), stop.current);
+            const ranges = mergeRanges([...before, ...r.ranges]);
+            const evs = [...(saved?.events ?? []), ...r.events];
+            saveCursor(ownerAddr, ranges, evs);
+            allEvents = [...allEvents, ...evs];
+            setScanned({ lo, head, ranges, at: Date.now(), paused: r.paused || Boolean(r.error) || stop.current.stopped });
+            const d = describeCoverage(ranges, lo, head);
+            note(
+              `Chain events: ${d.percent.toFixed(d.percent < 10 ? 2 : 1)}% of blocks ${fmt(lo)}–${fmt(head)} read (${fmt(r.queries)} new windows, ${r.events.length} new events, ${evs.length} in total).` +
+                (r.paused ? ` Paused: ${r.error} Press Scan again later to continue where it stopped.` : r.error ? ` Stopped early: ${r.error}` : "") +
+                (stop.current.stopped ? " Stopped by you; progress is kept." : ""),
+            );
+            return pairsFrom(evs, "logs");
           })(),
         );
       }
@@ -258,6 +325,27 @@ export function Workspace() {
     } finally {
       setRunning(false);
     }
+  };
+
+  // A deep link with ?owner= starts the scan once.
+  const autoStarted = useRef(false);
+  useEffect(() => {
+    // Waits for the explorer answer, so a configured explorer history is part of the first scan.
+    if (autoStarted.current || !isAddress(linkOwner) || explorerOn === null) return;
+    autoStarted.current = true;
+    void scan(linkOwner);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [linkOwner, explorerOn]);
+
+  const forgetProgress = () => {
+    if (!owner) return;
+    try {
+      window.localStorage.removeItem(cursorKey(owner));
+    } catch {
+      // ignore
+    }
+    setScanned(null);
+    setNotes((n) => [...n, "Saved scan progress for this address was cleared."]);
   };
 
   // Explorer source check for spenders with code (only when the site has the key), a few at a time.
@@ -290,10 +378,11 @@ export function Workspace() {
         .sort((a, b) => Number(b.open) - Number(a.open) || (b.pair.last?.block ?? 0) - (a.pair.last?.block ?? 0)),
     [pairs, current, now],
   );
-  const openRows = rows.filter((r) => r.open);
-  const shown = showClosed ? rows : openRows;
+  const matches = (r: Row) => !spenderFilter || r.pair.spender.toLowerCase() === spenderFilter.toLowerCase();
+  const openRows = rows.filter((r) => r.open && matches(r));
+  const shown = (showClosed ? rows : openRows).filter(matches);
   const tokenName = (t: string) => meta.get(t.toLowerCase())?.symbol ?? shortAddress(t, 6, 4);
-  const spenderName = (s: string) => KNOWN_SPENDERS.find((k) => k.address.toLowerCase() === s.toLowerCase())?.name ?? null;
+  const spenderName = (s: string) => knownSpenderName(s, curves) ?? serverLabels.get(s.toLowerCase()) ?? null;
   const changedAt = (p: Pair) => (p.last ? (times.get(p.last.block) ?? null) : null);
   const facts4 = (s: string) => {
     const l = labels?.get(s.toLowerCase());
@@ -331,8 +420,8 @@ export function Workspace() {
                 Stop scan
               </button>
             ) : (
-              <button type="button" className="nl-btn md" onClick={scan} data-testid="scan-go">
-                Scan permissions
+              <button type="button" className="nl-btn md" onClick={() => scan()} data-testid="scan-go">
+                {scanned?.paused ? "Continue scan" : "Scan permissions"}
               </button>
             )}
           </div>
@@ -347,7 +436,7 @@ export function Workspace() {
                 </option>
               ))}
             </select>
-            <span className="text-[var(--ink-55)]">≈ {depthBlocks.toLocaleString("en-US")} blocks</span>
+            <span className="text-[var(--ink-55)]">≈ {fmt(depthBlocks === 0 ? (head ?? 0) : depthBlocks)} blocks{depthBlocks === 0 || depthBlocks > 3_000_000 ? ", read over several visits; progress is kept" : ""}</span>
           </label>
           <label className="inline-flex items-center gap-2">
             <input type="checkbox" checked={useLogs} onChange={(e) => setUseLogs(e.target.checked)} /> Chain events
@@ -365,12 +454,12 @@ export function Workspace() {
               <>
                 <div className="flex flex-wrap justify-between gap-2 text-[13px]">
                   <span>
-                    Blocks {progress.from.toLocaleString("en-US")}–{progress.to.toLocaleString("en-US")} · window {progress.chunk.toLocaleString("en-US")} · {progress.events} events
+                    {fmt(progress.covered)} of {fmt(progress.total)} blocks read · window {fmt(progress.chunk)} · {progress.queries} windows · {progress.events} new events
                   </span>
-                  <span className="font-semibold text-[var(--olive)]">{Math.min(100, Math.round(((progress.head - progress.from + 1) / (progress.head - progress.stop + 1)) * 100))}%</span>
+                  <span className="font-semibold text-[var(--olive)]">{progress.total ? ((progress.covered / progress.total) * 100).toFixed(progress.covered / progress.total < 0.1 ? 2 : 0) : 100}%</span>
                 </div>
                 <div className="nl-bar">
-                  <i style={{ width: `${Math.min(100, ((progress.head - progress.from + 1) / (progress.head - progress.stop + 1)) * 100)}%` }} />
+                  <i style={{ width: `${progress.total ? Math.min(100, (progress.covered / progress.total) * 100) : 100}%` }} />
                 </div>
               </>
             ) : null}
@@ -385,7 +474,17 @@ export function Workspace() {
             ))}
           </ul>
         ) : null}
+        {scanned ? <CoverageView scanned={scanned} onForget={forgetProgress} /> : null}
       </div>
+
+      {spenderFilter ? (
+        <p className="nl-note m-0 flex flex-wrap items-center gap-2" data-testid="spender-filter">
+          Showing one spender: <strong>{spenderName(spenderFilter) ?? "Not listed on this site"}</strong> <span className="nl-mono break-all">{spenderFilter}</span>
+          <button type="button" className="nl-btn outline xs" onClick={() => setSpenderFilter(null)}>
+            Show all spenders
+          </button>
+        </p>
+      ) : null}
 
       {owner ? (
         <div className="grid grid-cols-2 gap-3 sm:grid-cols-4" data-testid="scan-stats">
@@ -581,6 +680,40 @@ export function Workspace() {
           queue={queue}
           ownerIsMe={ownerIsMe}
           connected={Boolean(address)}
+          batchSupport={batchSupport}
+          onSignAll={async (items) => {
+            if (!owner || items.length === 0) return;
+            const ps = items.map(pairOf);
+            const keys = new Set(items.map((i) => i.key));
+            const mark = (fn: (x: QItem) => QItem) => updateQueue((q) => q.map((x) => (keys.has(x.key) ? fn(x) : x)));
+            mark((x) => ({ ...x, state: "sending", note: undefined }));
+            try {
+              if (!onRobinhoodChain) await switchNetwork();
+              const id = await sendBatch(ps.map((p) => revokeCall(p, PERMIT2)));
+              mark((x) => ({ ...x, note: "Batch sent. Waiting for the chain…" }));
+              const until = Date.now() + 180_000;
+              let st = await batchStatus(id).catch(() => null);
+              while ((!st || st.state === "pending") && Date.now() < until) {
+                await new Promise((r) => setTimeout(r, 1500));
+                st = await batchStatus(id).catch(() => null);
+              }
+              const cur = await readCurrent(owner, ps);
+              setCurrent((m) => new Map([...m, ...cur]));
+              const nowSec = Math.floor(Date.now() / 1000);
+              const tx = st?.hashes[0];
+              updateQueue((q) =>
+                q.map((x) => {
+                  if (!keys.has(x.key)) return x;
+                  const stillOpen = isOpen(pairOf(x), cur.get(x.key), nowSec);
+                  const okState = st?.state === "confirmed" && !stillOpen;
+                  const note = !st || st.state === "pending" ? "No final status from the wallet yet; read again from the chain." : st.state === "failed" ? "The batch did not go through; nothing in it was applied." : stillOpen ? "Confirmed, but the permission still reads as open. Check the token." : "Closed in one batch, read again from the chain.";
+                  return { ...x, state: okState ? "done" : "failed", tx: tx ?? x.tx, note };
+                }),
+              );
+            } catch (e) {
+              mark((x) => ({ ...x, state: "failed", note: explain(e) }));
+            }
+          }}
           tokenName={tokenName}
           spenderName={spenderName}
           onConnect={openWallet}
@@ -617,7 +750,7 @@ export function Workspace() {
         <div className="nl-panel" data-testid="history">
           <p className="nl-kicker">Approval events found</p>
           <p className="nl-small mt-1">
-            {scanned ? `Chain events from block ${scanned.from.toLocaleString("en-US")} to ${scanned.to.toLocaleString("en-US")}` : "No event scan yet"}
+            {scanned ? `Chain events in ${fmt(describeCoverage(scanned.ranges, scanned.lo, scanned.head).covered)} read blocks between ${fmt(scanned.lo)} and ${fmt(scanned.head)}` : "No event scan yet"}
             {explorerOn ? " plus explorer history when it answered" : ""}. Newest first; each opens on the explorer.
           </p>
           {events.length === 0 ? (
@@ -672,11 +805,51 @@ export function Workspace() {
   );
 }
 
+function CoverageView({ scanned, onForget }: { scanned: { lo: number; head: number; ranges: Range[]; paused: boolean }; onForget: () => void }) {
+  const d = describeCoverage(scanned.ranges, scanned.lo, scanned.head);
+  const whole = describeCoverage(scanned.ranges, 1, scanned.head);
+  return (
+    <div className="mt-4 rounded-2xl border border-[var(--line-soft)] bg-white/70 p-4 text-[14px]" data-testid="coverage">
+      <div className="flex flex-wrap items-center justify-between gap-2">
+        <p className="m-0 font-bold">
+          Event coverage: {d.percent.toFixed(d.percent < 10 ? 2 : 1)}% of the chosen window · {whole.percent.toFixed(whole.percent < 10 ? 3 : 1)}% of the whole chain
+        </p>
+        <button type="button" className="nl-btn outline xs" onClick={onForget}>
+          Forget saved progress
+        </button>
+      </div>
+      <div className="nl-bar mt-3" aria-hidden="true">
+        <i style={{ width: `${Math.max(0.5, d.percent)}%` }} />
+      </div>
+      <p className="m-0 mt-3" data-testid="coverage-read">
+        Read:{" "}
+        {mergeRanges(scanned.ranges)
+          .slice(-3)
+          .reverse()
+          .map(([a, b]) => `${fmt(a)}–${fmt(b)}`)
+          .join(", ") || "nothing yet"}
+        {scanned.ranges.length > 3 ? ` and ${scanned.ranges.length - 3} older ranges` : ""}.
+      </p>
+      <p className="m-0 mt-1 text-[var(--ink-70)]" data-testid="coverage-missing">
+        Not read in this window:{" "}
+        {d.missing.length
+          ? `${d.missing
+              .slice(0, 3)
+              .map(([a, b]) => `${fmt(a)}–${fmt(b)}`)
+              .join(", ")}${d.missing.length > 3 ? ` and ${d.missing.length - 3} more gaps` : ""} (${fmt(d.total - d.covered)} blocks). Approvals given there are found only by the known-spender check, the explorer history or a check by hand.`
+          : "nothing, every block in it was read."}
+      </p>
+    </div>
+  );
+}
+
 function RevokeQueue({
   owner,
   queue,
   ownerIsMe,
   connected,
+  batchSupport,
+  onSignAll,
   tokenName,
   spenderName,
   onConnect,
@@ -694,9 +867,24 @@ function RevokeQueue({
   onRemove: (k: string) => void;
   onClearDone: () => void;
   onSign: (q: QItem) => Promise<void>;
+  batchSupport: () => Promise<BatchSupport>;
+  onSignAll: (items: QItem[]) => Promise<void>;
 }) {
   const busy = queue.some((q) => q.state === "sending");
   const done = queue.filter((q) => q.state === "done").length;
+  const pending = queue.filter((q) => q.state === "queued" || q.state === "failed");
+  const [asked, setAsked] = useState<BatchSupport | null>(null);
+  useEffect(() => {
+    if (!connected || !ownerIsMe) return;
+    let cancelled = false;
+    batchSupport().then((s) => {
+      if (!cancelled) setAsked(s);
+    });
+    return () => {
+      cancelled = true;
+    };
+  }, [connected, ownerIsMe, batchSupport]);
+  const support = connected && ownerIsMe ? asked : null;
   return (
     <div className="grid gap-4" data-testid="revoke">
       <div className="nl-panel">
@@ -719,6 +907,20 @@ function RevokeQueue({
         <p className="nl-small mt-4 mb-0">
           One transaction per row, signed by your own wallet after you read the call below. Each row is read again from the chain once its transaction lands. Revoking stops future use of that permission; it cannot undo transfers that already happened.
         </p>
+        {ownerIsMe && pending.length > 1 ? (
+          support === "supported" || support === "ready" ? (
+            <div className="mt-4 flex flex-wrap items-center gap-3">
+              <button type="button" className="nl-btn md" disabled={busy} onClick={() => onSignAll(pending)} data-testid="sign-batch">
+                Sign all {pending.length} in one batch
+              </button>
+              <span className="nl-small">Your wallet offers atomic batches (EIP-5792): the {pending.length} calls below run together or not at all, with one signature.</span>
+            </div>
+          ) : support === "none" ? (
+            <p className="nl-small mt-4 mb-0" data-testid="batch-none">
+              Your wallet does not offer atomic batches (EIP-5792), so each row is signed on its own.
+            </p>
+          ) : null
+        ) : null}
         {!connected ? (
           <button type="button" className="nl-btn md mt-4" onClick={onConnect}>
             Connect the wallet that owns these permissions

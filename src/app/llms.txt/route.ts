@@ -21,12 +21,15 @@ export function GET() {
     `- ${BRAND.url}/limits: what the tool can and cannot see`,
     `- ${BRAND.url}/token: ${BRAND.symbol}`,
     "",
+    "## Read API",
+    `- GET ${BRAND.url}/api/approvals?owner=0x… : open permissions of one owner (token, spender, spenderLabel, kind, amount, unlimited), counts, and which blocks were read. No key, CORS open for GET, cached about 2 minutes.`,
+    "",
     "## Contract",
     `- NulloSpenderLabels: ${labelsLive() ? CONTRACTS.labels : "not deployed yet"}`,
     "- setLabel(spender, name <= 32 printable ASCII, category 1..8, url https://… or empty) one per wallet per spender, updatable; removeLabel(spender); flag(spender, reason 1..6) once per wallet; unflag(spender); countsOf, labelsOf, flagOf, spendersFrom. No owner, no fee, never hides anything.",
     "",
     "## Token",
-    `- ${BRAND.symbol}: ${TOKEN.isLive ? BRAND.ca : "not launched yet"}. Analytics credits, premium alerts, monitoring and a developer API are planned, not live. No promise of value.`,
+    `- ${BRAND.symbol}: ${TOKEN.isLive ? BRAND.ca : "not launched yet"}. Analytics credits, premium alerts, monitoring and keyed developer access are planned, not live. No promise of value.`,
     "",
   ];
   return new Response(lines.join("\n"), { headers: { "content-type": "text/plain; charset=utf-8" } });

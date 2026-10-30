@@ -9,10 +9,9 @@ const CA: string = "TBA";
 /**
  * True once the domain points at this deployment. While false, the production *.vercel.app host is served
  * as is (kept out of search with noindex) instead of redirecting to a domain that does not serve the site.
- * 30 Oct 2026: nullo.live IS registered (Identity Digital RDAP 200, NS mcgrory/sara.ns.cloudflare.com) but has no
- * A/CNAME record yet (DoH: SOA only). Flip this once it serves this deployment.
+ * 30 Oct 2026: nullo.live serves this deployment (www redirects to it).
  */
-export const DOMAIN_LIVE = false;
+export const DOMAIN_LIVE = true;
 
 export const isAddress = (v: string): v is `0x${string}` => /^0x[0-9a-fA-F]{40}$/.test(v);
 
@@ -21,8 +20,8 @@ const SLUG = "nullo";
 /** Shown upper case everywhere; the owner wrote it as $nullo. */
 const TICKER = "NULLO";
 const DOMAIN = "nullo.live";
-/** X account from the owner's order (x.com/nullo). It looks generic; confirm it belongs to the project. */
-const X_HANDLE = "nullo";
+/** X account confirmed by the owner on 30 Oct 2026. */
+const X_HANDLE = "nullolive";
 
 export const BRAND = {
   name: NAME,
@@ -140,18 +139,5 @@ export function buyUrl(): string {
 /** Multicall3 at its canonical address (code present on chain 4663, checked 30 Oct 2026). Used for batched reads. */
 export const MULTICALL3 = "0xcA11bde05977b3631167028862bE2a173976CA11";
 
-/** Canonical Permit2 (code present on chain 4663, checked 30 Oct 2026). */
-export const PERMIT2 = "0x000000000022D473030F116dDEE9F6B43aC78BA3";
-
-/**
- * Spenders the quick check reads for every token in the list, even when no approval event was found. Uniswap's
- * addresses for chain 4663 (its published address book), each confirmed to hold code on 30 Oct 2026. A name here is a
- * fact about who deployed the address, not a judgement; community labels come from the NulloSpenderLabels contract.
- */
-export const KNOWN_SPENDERS: readonly { address: string; name: string }[] = [
-  { address: PERMIT2, name: "Permit2 (Uniswap)" },
-  { address: "0x8876789976dEcBfCbBbe364623C63652db8C0904", name: "Uniswap Universal Router" },
-  { address: "0x89E5Db8b5aa49aa85AC63F691524311AeB649eBA", name: "Uniswap v2 Router" },
-  { address: "0x73991a25C818Bf1f1128dEAaB1492D45638DE0D3", name: "Uniswap v3 Positions" },
-  { address: "0x58daec3116aae6D93017bAAea7749052E8a04fA7", name: "Uniswap v4 Positions" },
-];
+// Permit2, the Pons factory and the quick-check spender list live in src/config/spenders.ts (with how each was confirmed).
+export { KNOWN_SPENDERS, PERMIT2, PONS, knownSpenderName, type KnownSpender } from "@/config/spenders";

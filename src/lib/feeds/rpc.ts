@@ -14,10 +14,14 @@ const endpoints = () => (isLocal(serverRpc()) ? [serverRpc()] : [serverRpc(), CH
 let preferred = 0;
 
 export class RpcError extends Error {
-  constructor(message: string, readonly revert = false, readonly data: string | null = null) {
+  constructor(message: string, readonly revert = false, readonly data: string | null = null, readonly status = 0) {
     super(message);
   }
 }
+
+/** The official RPC answers bursts with HTTP 429; the same endpoint is asked again after these pauses (ms). */
+const BUSY_RETRIES = [400, 1200];
+const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
 
 /** Largest upstream answer any server read accepts; the stream is aborted past it. */
 export const MAX_RESPONSE_BYTES = 2_000_000;
@@ -27,7 +31,17 @@ async function post(url: string, body: unknown) {
   const timer = setTimeout(() => ctrl.abort(), 7000);
   try {
     const res = await fetch(url, { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify(body), cache: "no-store", signal: ctrl.signal });
-    if (!res.ok || !res.body) throw new RpcError(`RPC ${res.status}`);
+    if (!res.ok || !res.body) {
+      // Keep the node's own words (a refused range, a rate limit) instead of a bare status code.
+      const t = res.body ? await readCappedResponse(res, 4_000).catch(() => null) : null;
+      let m = "";
+      try {
+        m = (JSON.parse(t ?? "") as { error?: { message?: string } }).error?.message ?? "";
+      } catch {
+        // not JSON
+      }
+      throw new RpcError(`RPC ${res.status}${m ? `: ${m.slice(0, 200)}` : ""}`, false, null, res.status);
+    }
     const text = await readCappedResponse(res, MAX_RESPONSE_BYTES);
     if (text === null) {
       ctrl.abort();
@@ -40,13 +54,26 @@ async function post(url: string, body: unknown) {
   }
 }
 
+/** post() that asks the same endpoint again when it answers 429 (busy), before the caller moves to the next one. */
+async function postPatient(url: string, body: unknown) {
+  for (let k = 0; ; k++) {
+    try {
+      return await post(url, body);
+    } catch (e) {
+      if (!(e instanceof RpcError && e.status === 429) || k >= BUSY_RETRIES.length) throw e;
+      await sleep(BUSY_RETRIES[k] + Math.floor(Math.random() * 200));
+    }
+  }
+}
+
 export async function rpc<T>(method: string, params: unknown[]): Promise<T> {
   const list = endpoints();
   let last: unknown;
+  let busy: RpcError | undefined;
   for (let n = 0; n < list.length; n++) {
     const i = (preferred + n) % list.length;
     try {
-      const body = (await post(list[i], { jsonrpc: "2.0", id: 1, method, params })) as {
+      const body = (await postPatient(list[i], { jsonrpc: "2.0", id: 1, method, params })) as {
         result?: T;
         error?: { message: string; code?: number; data?: unknown };
       };
@@ -62,20 +89,23 @@ export async function rpc<T>(method: string, params: unknown[]): Promise<T> {
       return body.result as T;
     } catch (error) {
       if (error instanceof RpcError && error.revert) throw error;
+      if (error instanceof RpcError && error.status === 429) busy ??= error;
       last = error;
     }
   }
-  throw last;
+  // A busy main endpoint says more than a fallback's plan refusal: the caller should wait, not shrink its query.
+  throw busy ?? last;
 }
 
 export async function rpcBatch<T>(calls: { method: string; params: unknown[] }[]): Promise<(T | null)[]> {
   if (calls.length === 0) return [];
   const list = endpoints();
   let last: unknown;
+  let busy: RpcError | undefined;
   for (let n = 0; n < list.length; n++) {
     const i = (preferred + n) % list.length;
     try {
-      const body = (await post(
+      const body = (await postPatient(
         list[i],
         calls.map((c, id) => ({ jsonrpc: "2.0", id, ...c })),
       )) as { id: number; result?: T; error?: unknown }[];
@@ -86,10 +116,12 @@ export async function rpcBatch<T>(calls: { method: string; params: unknown[] }[]
       return out;
     } catch (error) {
       if (error instanceof RpcError && error.revert) throw error;
+      if (error instanceof RpcError && error.status === 429) busy ??= error;
       last = error;
     }
   }
-  throw last;
+  // A busy main endpoint says more than a fallback's plan refusal: the caller should wait, not shrink its query.
+  throw busy ?? last;
 }
 
 export const ethCall = (to: string, data: string) => rpc<string>("eth_call", [{ to, data }, "latest"]);
@@ -118,6 +150,8 @@ export const pad = (n: number | bigint) => BigInt(n).toString(16).padStart(64, "
 export async function rpcCapped<T>(method: string, params: unknown[], maxBytes: number, onTooLarge: () => Error): Promise<T> {
   const list = endpoints();
   let last: unknown;
+  let busy = 0;
+  let busyErr: RpcError | undefined;
   for (let n = 0; n < list.length; n++) {
     const i = (preferred + n) % list.length;
     const ctrl = new AbortController();
@@ -131,6 +165,12 @@ export async function rpcCapped<T>(method: string, params: unknown[], maxBytes: 
         signal: ctrl.signal,
       });
       if (!res.body) throw new RpcError(`RPC ${res.status}`);
+      if (res.status === 429 && busy < BUSY_RETRIES.length) {
+        await res.body.cancel().catch(() => undefined);
+        await sleep(BUSY_RETRIES[busy++] + Math.floor(Math.random() * 200));
+        n--; // same endpoint again
+        continue;
+      }
       if (!res.ok) {
         // Some nodes answer a refused query with HTTP 400 and a JSON-RPC error body: keep its message.
         const t = await readCappedResponse(res, 4_000).catch(() => null);
@@ -140,7 +180,7 @@ export async function rpcCapped<T>(method: string, params: unknown[], maxBytes: 
         } catch {
           // not JSON
         }
-        throw new RpcError(m, /range|limit|results|exceed|spans/i.test(m) && !/plan|personal token|archive/i.test(m));
+        throw new RpcError(res.status === 429 ? `RPC 429: ${m}` : m, /range|limit|results|exceed|spans/i.test(m) && !/plan|personal token|archive/i.test(m), null, res.status);
       }
       const text = await readCappedResponse(res, maxBytes);
       if (text === null) {
@@ -156,10 +196,11 @@ export async function rpcCapped<T>(method: string, params: unknown[], maxBytes: 
     } catch (error) {
       // "Too large" and range refusals are answers about this query: do not retry them elsewhere.
       if (error instanceof RpcError ? error.revert : !(error instanceof SyntaxError || (error instanceof Error && (error.name === "AbortError" || error.name === "TypeError")))) throw error;
+      if (error instanceof RpcError && error.status === 429) busyErr ??= error;
       last = error;
     } finally {
       clearTimeout(timer);
     }
   }
-  throw last;
+  throw busyErr ?? last;
 }

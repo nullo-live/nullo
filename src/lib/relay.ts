@@ -12,18 +12,25 @@ import { PERMIT2_TOPICS, TOKEN_TOPICS } from "@/lib/approvals";
  *     Multicall3, Permit2), or to ANY address when the call is one of a few token read functions (allowance,
  *     isApprovedForAll, getApproved, symbol, decimals, name, balanceOf, totalSupply, supportsInterface) with a low gas cap;
  *   - Multicall3 aggregate3 only when every inner call is such a read;
- *   - eth_getLogs in three shapes: approval events of one owner (no address, topics [approval events, owner]),
- *     Permit2 events of one owner (address Permit2, topics [Permit2 events, owner]), and NulloSpenderLabels events.
+ *   - eth_getLogs in three shapes: approval events of one owner (no address, topics [token approval and/or Permit2
+ *     events, owner]), Permit2 events of one owner (address Permit2, topics [Permit2 events, owner]), and
+ *     NulloSpenderLabels events.
+ * Owner-filtered log queries are index lookups on the node, so they are priced by 5,000-block steps and may span
+ * the public RPC's own limit (30,000 blocks); three of them fit in one batch.
  */
 
 export const MAX_CALLS = 20;
 export const MAX_LOGS_PER_BATCH = 3;
-/** Widest single approval query (no address filter, so every token on the chain is searched). */
-export const MAX_OWNER_LOG_SPAN = 10_000;
+/** Widest single approval query: the official RPC's own eth_getLogs limit (checked 30 Oct 2026). */
+export const MAX_OWNER_LOG_SPAN = 30_000;
 /** Widest single query on the labels contract. */
 export const MAX_LABEL_LOG_SPAN = 20_000;
-/** Total blocks one batch may cover. */
-export const MAX_BATCH_SPAN = 30_000;
+/** Total blocks one batch may cover (three owner windows). */
+export const MAX_BATCH_SPAN = 90_000;
+/** Owner and Permit2 log queries are priced per this many blocks. */
+export const OWNER_LOG_STEP = 5_000;
+/** Inner calls of one Multicall3 batch that cost one unit. */
+export const MULTICALL_CALLS_PER_UNIT = 20;
 export const MAX_GAS = 5_000_000;
 /** Gas cap for a token read sent to an address the site does not know. */
 export const MAX_FOREIGN_GAS = 200_000;
@@ -126,6 +133,15 @@ export function namedAddresses(body: Call | Call[]): string[] {
   return [...out].filter((a) => /^0x[0-9a-f]{40}$/.test(a));
 }
 
+/** Number of inner calls in an aggregate3 call (0 when it does not decode). */
+export function multicallSize(data: string): number {
+  try {
+    return (decodeFunctionData({ abi: MULTICALL3_ABI, data: data as `0x${string}` }).args[0] as readonly unknown[]).length;
+  } catch {
+    return 0;
+  }
+}
+
 /** Checks a Multicall3 aggregate3 call: every inner call must be a token read (or a Permit2 / labels read). */
 export function checkMulticall(data: string, labels: string = CONTRACTS.labels): string | null {
   if (data.slice(0, 10).toLowerCase() !== AGGREGATE3) return "Only Multicall3 aggregate3 is relayed.";
@@ -174,7 +190,9 @@ export function logShape(address: unknown, topics: unknown, labelsAddress: strin
     return Boolean(o && o.length === 1 && typeof o[0] === "string" && TOPIC.test(o[0].toLowerCase()) && PADDED.test(o[0].toLowerCase()));
   };
   if (address === undefined || address === null) {
-    if (!first || first.length < 1 || first.length > 2 || !first.every((t) => (TOKEN_TOPICS as readonly string[]).includes(lower(t)))) return { error: "Approval queries must name the approval events." };
+    // Token approvals and Permit2's own events in one query: Permit2 events are recognised by their emitter later.
+    const allowed = [...TOKEN_TOPICS, ...PERMIT2_TOPICS] as readonly string[];
+    if (!first || first.length < 1 || first.length > allowed.length || !first.every((t) => allowed.includes(lower(t)))) return { error: "Approval queries must name the approval events." };
     if (!ownerTopic()) return { error: "Approval queries need exactly one owner in topic 1." };
     return { shape: "owner" };
   }
@@ -239,8 +257,9 @@ export function checkBatch(calls: Call[], targets = readTargets(), labelsAddress
       if (width > (shaped.shape === "labels" ? MAX_LABEL_LOG_SPAN : MAX_OWNER_LOG_SPAN)) return { error: "Log range too wide." };
       span += width;
       if (span > MAX_BATCH_SPAN) return { error: "Log range too wide." };
-      // Priced by the blocks it covers; a query without an address filter searches every contract, so it costs double.
-      units += Math.ceil(width / 1_000) * (shaped.shape === "owner" ? 2 : 1);
+      // Priced by the blocks it covers. Owner-filtered queries (owner topic, with or without Permit2 as address) are
+      // index lookups, so they step by OWNER_LOG_STEP; label queries scan one contract's events by 1,000 blocks.
+      units += shaped.shape === "labels" ? Math.ceil(width / 1_000) : Math.ceil(width / OWNER_LOG_STEP);
     }
     if (c.method === "eth_call" || c.method === "eth_estimateGas") {
       if (params.length > 2) return { error: "State overrides are not relayed." };
@@ -260,8 +279,8 @@ export function checkBatch(calls: Call[], targets = readTargets(), labelsAddress
       if (to === MULTICALL3.toLowerCase()) {
         const m = checkMulticall(d, labelsAddress);
         if (m) return { error: m };
-        // A multicall is priced by its inner calls.
-        units += Math.ceil((d.length - 10) / 600);
+        // A multicall is one upstream call: priced by its number of inner reads.
+        units += Math.ceil(multicallSize(d) / MULTICALL_CALLS_PER_UNIT);
       } else if (to === PERMIT2.toLowerCase()) {
         if (d.slice(0, 10).toLowerCase() !== PERMIT2_ALLOWANCE) return { error: "Only Permit2 allowance reads are relayed." };
       } else if (d.length > MAX_CALL_DATA) return { error: "Call data too large." };

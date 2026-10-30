@@ -18,7 +18,7 @@ export default function LimitsPage() {
         {
           h: "It may not find every approval",
           p: [
-            `${CHAIN.name} produces many blocks per second, and public RPC endpoints only search events over a limited block range per request. The event scan therefore covers the window you choose, newest first, and says exactly which blocks it read. Older approvals outside that window are only found by the quick check (popular tokens against well-known spenders), by a pair you check by hand, or by the explorer source when this site has its key configured.`,
+            `${CHAIN.name} produces many blocks per second, and public RPC endpoints only search events over a limited block range per request. The event scan therefore reads the window you choose in steps of up to 30,000 blocks, newest first, and shows which blocks it read and which it did not. Progress is kept in your browser, so a long window (up to the whole chain) can be finished over several visits. Approvals in blocks not read yet are only found by the known-spender check (the most traded tokens against confirmed routers, aggregators and each token's Pons curve), by a pair you check by hand, or by the explorer source when this site has its key configured.`,
             "An empty result means nothing was found in what was read. It does not prove the wallet has no open permissions.",
           ],
         },

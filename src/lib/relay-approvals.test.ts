@@ -3,7 +3,7 @@ import assert from "node:assert/strict";
 import { encodeFunctionData } from "viem";
 import { MULTICALL3, PERMIT2 } from "@/config/brand";
 import { ERC20_ABI, MULTICALL3_ABI, NFT_ABI, PERMIT2_ABI } from "./abi";
-import { APPROVAL_FOR_ALL_TOPIC, APPROVAL_TOPIC, P2_APPROVAL_TOPIC, padTopic } from "./approvals";
+import { APPROVAL_FOR_ALL_TOPIC, APPROVAL_TOPIC, P2_APPROVAL_TOPIC, P2_LOCKDOWN_TOPIC, P2_PERMIT_TOPIC, padTopic } from "./approvals";
 import { MAX_MULTICALL, checkBatch, checkMulticall, isTokenRead, logShape, type Call } from "./relay";
 
 const OWNER = "0x1111111111111111111111111111111111111111";
@@ -68,13 +68,29 @@ test("Permit2 and labels shapes", () => {
   assert.ok("error" in logShape(LAB, [labeled], LAB), "unknown event");
 });
 
-test("approval log windows are capped and priced double", () => {
-  const ok = checkBatch([logs({ topics: [APPROVAL_TOPIC, owner], fromBlock: "0x1", toBlock: "0x2710" })]);
-  assert.ok("units" in ok && ok.units === 10 + 20);
-  assert.ok("error" in checkBatch([logs({ topics: [APPROVAL_TOPIC, owner], fromBlock: "0x1", toBlock: "0x2711" })]));
+test("approval log windows: up to 30,000 blocks, priced by 5,000-block steps, three per batch", () => {
+  const ok = checkBatch([logs({ topics: [APPROVAL_TOPIC, owner], fromBlock: "0x1", toBlock: "0x7530" })]);
+  assert.ok("units" in ok && ok.units === 10 + 6);
+  assert.ok("error" in checkBatch([logs({ topics: [APPROVAL_TOPIC, owner], fromBlock: "0x1", toBlock: "0x7531" })]), "30,001 blocks refused");
   assert.ok("error" in checkBatch([logs({ topics: [APPROVAL_TOPIC, owner], fromBlock: "0x1", toBlock: "latest" })]));
   assert.ok("units" in checkBatch([logs({ topics: [APPROVAL_TOPIC, owner], ...range })]));
-  const three = [0, 1, 2].map((i) => logs({ topics: [APPROVAL_TOPIC, owner], fromBlock: `0x${(i * 10000 + 1).toString(16)}`, toBlock: `0x${(i * 10000 + 10000).toString(16)}` }));
+  const w = (i: number) => logs({ topics: [APPROVAL_TOPIC, owner], fromBlock: `0x${(i * 30000 + 1).toString(16)}`, toBlock: `0x${(i * 30000 + 30000).toString(16)}` });
+  const three = [0, 1, 2].map(w);
   assert.ok("units" in checkBatch(three));
-  assert.ok("error" in checkBatch([...three, logs({ topics: [APPROVAL_TOPIC, owner], ...range })]));
+  assert.ok("error" in checkBatch([...three, logs({ topics: [APPROVAL_TOPIC, owner], ...range })]), "a fourth query is refused");
+});
+
+test("one owner query may name token approvals and Permit2 events together", () => {
+  const all = [APPROVAL_TOPIC, APPROVAL_FOR_ALL_TOPIC, P2_APPROVAL_TOPIC, P2_PERMIT_TOPIC, P2_LOCKDOWN_TOPIC];
+  assert.deepEqual(logShape(undefined, [all, owner], LAB), { shape: "owner" });
+  assert.ok("error" in logShape(undefined, [[...all, `0x${"ab".repeat(32)}`], owner], LAB), "no other events");
+  assert.ok("error" in logShape(undefined, [all], LAB), "owner still required");
+});
+
+test("a multicall is priced by its number of inner reads", () => {
+  const mc = (n: number) => encodeFunctionData({ abi: MULTICALL3_ABI, functionName: "aggregate3", args: [Array.from({ length: n }, () => ({ target: ANY as `0x${string}`, allowFailure: true, callData: allowance }))] });
+  const one = checkBatch([{ method: "eth_call", params: [{ to: MULTICALL3, data: mc(1) }, "latest"] }]);
+  const full = checkBatch([{ method: "eth_call", params: [{ to: MULTICALL3, data: mc(MAX_MULTICALL) }, "latest"] }]);
+  assert.ok("units" in one && one.units === 2 + 1);
+  assert.ok("units" in full && full.units === 2 + MAX_MULTICALL / 20);
 });

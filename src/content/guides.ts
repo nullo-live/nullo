@@ -145,9 +145,10 @@ export const GUIDES: Guide[] = [
         ],
       },
       {
-        h: "One at a time",
+        h: "One at a time, or one batch you can read",
         p: [
-          "The revoke queue runs one transaction at a time. After each confirmation the state is read again from the chain, and the next row only opens when you ask for it. Nothing is batched behind your back, and nothing is signed for you.",
+          "The revoke queue runs one transaction at a time. After each confirmation the state is read again from the chain, and the next row only opens when you ask for it. Nothing is signed for you.",
+          "If your wallet supports atomic batches (EIP-5792), the queue also offers one signature for every row. The batch holds exactly the calls listed in the queue, runs all of them or none, and every row is read again from the chain afterwards. Your wallet should list each call before you confirm.",
         ],
       },
     ],
