@@ -38,9 +38,8 @@ export const BRAND = {
   description: `${NAME} shows which token permissions your wallet has given on Robinhood Chain: every ERC-20 allowance, NFT operator approval and Permit2 allowance it can find, who received it, hints to review it, and a revoke queue your own wallet signs one transaction at a time.`,
   x: `https://x.com/${X_HANDLE}`,
   xHandle: `@${X_HANDLE}`,
-  // Public source repository. Set to "" to hide every GitHub link on the site.
-  // No public repository yet: every GitHub link to it stays hidden until this is set.
-  github: "",
+  // Public source repository (open source, MIT).
+  github: "https://github.com/nullo-live/nullo",
   ca: CA,
 } as const;
 
